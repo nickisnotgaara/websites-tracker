@@ -301,3 +301,81 @@ def test_discover_urls_recurses_into_sitemap_index():
         urls = discover_urls("https://example.com")
 
     assert urls == ["https://example.com/from-nested"]
+
+
+# --- scrape_markdown ---
+
+from src.services.discovery.scrape import scrape_markdown
+
+
+HTML_WITH_ARTICLE = """<!DOCTYPE html>
+<html>
+<head><title>Test Page</title></head>
+<body>
+<nav><a href="/">Home</a></nav>
+<article>
+  <h1>Main Title</h1>
+  <p>This is the first paragraph of the article with some content.</p>
+  <p>This is the second paragraph with more details and explanations.</p>
+</article>
+<footer>Footer text here</footer>
+</body>
+</html>"""
+
+
+def test_scrape_markdown_extracts_article():
+    resp = _mock_response(200, HTML_WITH_ARTICLE)
+    resp.headers = {"content-type": "text/html; charset=utf-8"}
+
+    with patch("src.services.discovery.scrape.httpx.get", return_value=resp):
+        result = scrape_markdown("https://example.com/article")
+
+    assert isinstance(result, str)
+    assert "Main Title" in result
+    assert "first paragraph" in result
+    # Navigation/footer usually stripped by trafilatura
+    assert "Footer text" not in result
+
+
+def test_scrape_markdown_404_returns_empty():
+    resp = _mock_response(404)
+
+    with patch("src.services.discovery.scrape.httpx.get", return_value=resp):
+        result = scrape_markdown("https://example.com/missing")
+
+    assert result == ""
+
+
+def test_scrape_markdown_non_html_returns_empty():
+    resp = _mock_response(200, "binary junk")
+    resp.headers = {"content-type": "application/pdf"}
+
+    with patch("src.services.discovery.scrape.httpx.get", return_value=resp):
+        result = scrape_markdown("https://example.com/file.pdf")
+
+    assert result == ""
+
+
+def test_scrape_markdown_timeout_returns_empty():
+    with patch(
+        "src.services.discovery.scrape.httpx.get",
+        side_effect=httpx.TimeoutException("timed out"),
+    ):
+        result = scrape_markdown("https://example.com/slow")
+
+    assert result == ""
+
+
+def test_scrape_markdown_truncates_at_max_chars():
+    """Long content gets truncated to ~max_chars at the last newline."""
+    long_text = "lorem ipsum dolor sit amet. " * 5000  # ~250KB
+    html = f"<!DOCTYPE html><html><body><article><p>{long_text}</p></article></body></html>"
+    resp = _mock_response(200, html)
+    resp.headers = {"content-type": "text/html; charset=utf-8"}
+
+    with patch("src.services.discovery.scrape.httpx.get", return_value=resp):
+        result = scrape_markdown("https://example.com/long", max_chars=1000)
+
+    assert len(result) <= 1000
+    # Truncation at last newline → result should not end mid-word
+    assert not result.endswith(" amet")  # was truncated
