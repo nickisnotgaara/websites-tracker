@@ -1,0 +1,32 @@
+services:
+  app:
+    build: .
+    container_name: competitor_tracker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Moscow
+      # Force DeepSeek specifically for this deployment
+      - AI_PROVIDER=deepseek
+      # Ensure config knows we are in container if needed (optional)
+      - IN_DOCKER=true
+      # Explicitly override Firecrawl URL to use valid host internal address
+      - FIRECRAWL_API_URL=http://host.docker.internal:3002
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persist data (database)
+      - ./data:/app/data
+      # Persist logs
+      - ./logs:/app/logs
+      # Mount credentials securely
+      - ./credentials.json:/app/credentials.json:ro
+    # Healthcheck to ensure app is running (optional, basic check)
+    # healthcheck:
+    #   test: ["CMD", "pgrep", "-f", "main.py"]
+    #   interval: 1m
+    #   timeout: 10s
+    #   retries: 3
+
