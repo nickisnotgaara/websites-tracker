@@ -15,7 +15,6 @@ from src.services.bot.keyboards import (
     back_button,
 )
 from src.services.monitor import monitor_service, clean_html
-from src.services.firecrawl import firecrawl_service
 from src.services.ai import ai_service
 from src.services.gsheets import gsheets_service
 

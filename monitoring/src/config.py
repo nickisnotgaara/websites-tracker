@@ -7,12 +7,6 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str
     TELEGRAM_ADMIN_IDS: list[int] = []  # Initial admins defined in env
 
-    # Firecrawl
-    FIRECRAWL_API_URL: str = "http://localhost:3002"
-    FIRECRAWL_API_KEY: str = (
-        "fc-YOUR_KEY"  # Placeholder if local doesn't require it, but lib might
-    )
-
     # Ollama / AI
     AI_PROVIDER: str = "deepseek"  # "ollama" or "deepseek"
     AI_API_KEY: str = None

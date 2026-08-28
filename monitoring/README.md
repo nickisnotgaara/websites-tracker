@@ -1,33 +1,56 @@
-# Competitor Tracker 🕵️‍♀️👗
+# Competitor Monitor
 
-Система отслеживания новых коллекций на сайтах конкурентов.
+Telegram bot + scheduler that monitors competitor bridal-shop websites for new
+collection pages, analyzes changes with DeepSeek, and logs findings to Google
+Sheets.
 
-## Функционал
+## What it does
 
-- 🔍 **Мониторинг**: Автоматический поиск новых страниц на сайтах свадебных салонов.
-- 📊 **Google Sheets**:
-  - Лист "Отслеживаемые конкуренты": Источник сайтов для проверки (Столбец A).
-  - Лист "Новинки у конкурентов": Журнал найденных коллекций (Ссылка, Дата, Текст, Новые страницы).
-- 🧠 **AI Анализ**: Анализ контента через `ollama` (модель `gpt-oss:120b-cloud`) для выявления коллекций.
-- 🤖 **Telegram Бот**:
-  - Уведомления о новинках.
-  - Ручной запуск проверки.
-  - Управление списком пользователей (Админка).
-- 🕒 **Планировщик**: Автоматический запуск проверки каждый день в 08:00 по МСК.
+1. Cron at 08:00 Moscow time (or manual "🚀 Начать парсинг" in Telegram)
+   triggers a check
+2. For each competitor URL in the Google Sheet "Отслеживаемые конкуренты":
+   - Sitemap discovery (`/sitemap.xml`, `/robots.txt` → sitemap, link fallback)
+   - Diff vs known URLs in `data/tracker.db`
+   - For new URLs: cluster + sample → scrape markdown → DeepSeek analysis
+3. Sends summary to all admin users via Telegram
+4. Logs new collections to Google Sheet "Новинки у конкурентов"
 
-## Установка
+## Local dev
 
-- **Требования**: Python 3.11+, `uv` (пакетный менеджер).
-- **Зависимости**:
-  ```bash
-  uv sync
-  ```
-- **Настройка**:
-  - Заполните `.env`:
-    ```ini
-    TELEGRAM_BOT_TOKEN=...
-    SPREADSHEET_ID=ваш_id_таблицы
-    ```
-  - Положите `credentials.json` от Service Account в корень проекта.
+```bash
+cd monitoring
+uv sync
+cp .env.example .env  # fill in TELEGRAM_BOT_TOKEN, SPREADSHEET_ID, AI_API_KEY
+# credentials.json from Google Cloud service account goes in this dir
+uv run main.py
+```
 
+## Tests
 
+```bash
+uv run pytest tests/
+```
+
+## Docker deploy
+
+```bash
+cd monitoring
+docker build -t competitor-monitor .
+docker run -d --name competitor-monitor \
+  --restart unless-stopped \
+  -v $(pwd)/data:/app/data \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/.env:/app/.env:ro \
+  -v $(pwd)/credentials.json:/app/credentials.json:ro \
+  competitor-monitor
+```
+
+## Logs
+
+`logs/app.log` is rotated daily by loguru. View with `tail -f logs/app.log`.
+
+## Data
+
+`data/tracker.db` (sqlitedict) — single source of truth for known URLs per
+competitor. Safe to delete for a clean reset; the bot will re-initialize on
+the next run.
