@@ -6,7 +6,7 @@ import re
 
 from src.config import settings
 from src.storage import db
-from src.services.firecrawl import firecrawl_service
+from src.services import discovery
 from src.services.ai import ai_service
 from src.services.gsheets import gsheets_service
 
@@ -128,30 +128,14 @@ class MonitorService:
         is_known_site = len(known_urls_raw) > 0
         known_map = {normalize_url(u) for u in known_urls_raw}
 
-        # 2. Map Site (with 0-result retry)
-        curr_urls_raw = []
-        for attempt in range(3):
-            try:
-                curr_urls_raw = await asyncio.to_thread(
-                    firecrawl_service.map_site, domain_url
-                )
-                if curr_urls_raw:
-                    break
+        # 2. Map Site (discover_urls has its own retry+timeout; never raises)
+        curr_urls_raw = await asyncio.to_thread(
+            discovery.discover_urls, domain_url
+        )
 
-                logger.warning(
-                    f"Map returned 0 URLs for {domain_url}. Retrying ({attempt + 1}/3)..."
-                )
-                await asyncio.sleep(5)  # Wait 5s before retry
-            except Exception as e:
-                logger.error(f"Mapping failed for {domain_url}: {e}")
-                if attempt == 2:
-                    return  # Give up after 3 exceptions
-                await asyncio.sleep(5)
-
-        # If still empty after retries
         if not curr_urls_raw:
             logger.error(
-                f"Failed to map {domain_url} after 3 attempts (0 URLs found). Skipping."
+                f"No URLs discovered for {domain_url}. Skipping."
             )
             return
 
@@ -198,7 +182,7 @@ class MonitorService:
 
             logger.info(f"Scraping sample page: {url}")
             try:
-                content = await asyncio.to_thread(firecrawl_service.scrape_url, url)
+                content = await asyncio.to_thread(discovery.scrape_markdown, url)
                 if content:
                     updates_found.append((url, content))
             except Exception as e:
