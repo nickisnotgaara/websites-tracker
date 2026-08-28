@@ -379,3 +379,26 @@ def test_scrape_markdown_truncates_at_max_chars():
     assert len(result) <= 1000
     # Truncation at last newline → result should not end mid-word
     assert not result.endswith(" amet")  # was truncated
+
+
+# --- _is_same_domain ---
+
+from src.services.discovery.sitemap import _is_same_domain
+
+
+class TestSameDomain:
+    def test_same_domain_strips_default_https_port(self):
+        """https://example.com:443/foo is same domain as https://example.com."""
+        assert _is_same_domain("https://example.com:443/foo", "https://example.com") is True
+
+    def test_same_domain_strips_default_http_port(self):
+        """http://example.com:80/foo is same domain as http://example.com."""
+        assert _is_same_domain("http://example.com:80/foo", "http://example.com") is True
+
+    def test_same_domain_treats_www_as_same(self):
+        """https://www.example.com/foo is same domain as https://example.com."""
+        assert _is_same_domain("https://www.example.com/foo", "https://example.com") is True
+
+    def test_same_domain_rejects_different_domain(self):
+        """https://other.com/foo is NOT the same domain as https://example.com."""
+        assert _is_same_domain("https://other.com/foo", "https://example.com") is False

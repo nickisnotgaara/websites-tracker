@@ -128,14 +128,23 @@ class MonitorService:
         is_known_site = len(known_urls_raw) > 0
         known_map = {normalize_url(u) for u in known_urls_raw}
 
-        # 2. Map Site (discover_urls has its own retry+timeout; never raises)
+        # 2. Map Site (discover_urls has its own retry+timeout; never raises).
+        # Outer 1-retry on empty result catches "200 with empty body" (deployment in progress, etc.)
         curr_urls_raw = await asyncio.to_thread(
             discovery.discover_urls, domain_url
         )
+        if not curr_urls_raw:
+            logger.warning(
+                f"No URLs discovered for {domain_url} on first attempt; retrying after 5s..."
+            )
+            await asyncio.sleep(5)
+            curr_urls_raw = await asyncio.to_thread(
+                discovery.discover_urls, domain_url
+            )
 
         if not curr_urls_raw:
             logger.error(
-                f"No URLs discovered for {domain_url}. Skipping."
+                f"No URLs discovered for {domain_url} after retry. Skipping."
             )
             return
 
@@ -181,12 +190,9 @@ class MonitorService:
                 continue
 
             logger.info(f"Scraping sample page: {url}")
-            try:
-                content = await asyncio.to_thread(discovery.scrape_markdown, url)
-                if content:
-                    updates_found.append((url, content))
-            except Exception as e:
-                logger.error(f"Skipping scrape for {url}: {e}")
+            content = await asyncio.to_thread(discovery.scrape_markdown, url)
+            if content:
+                updates_found.append((url, content))
 
         # All caught URLs (even unsampled) are saved to DB to prevent re-detection
         db_save_set = new_urls  # We save ALL raw new URLs, not just unique ones

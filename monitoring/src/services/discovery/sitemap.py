@@ -67,9 +67,18 @@ _DEFAULT_HEADERS = {"User-Agent": "competitor-monitor/1.0"}
 
 
 def _is_same_domain(url: str, base_domain: str) -> bool:
-    """Return True if url's netloc matches base_domain's netloc."""
+    """Return True if url's netloc matches base_domain's netloc (modulo default port and www.)."""
     try:
-        return urlparse(url).netloc == urlparse(base_domain).netloc
+        def _normalize_netloc(s: str) -> str:
+            parsed = urlparse(s)
+            nl = parsed.netloc.lower()
+            if nl.startswith("www."):
+                nl = nl[4:]
+            if (nl.endswith(":443") and parsed.scheme == "https") or \
+               (nl.endswith(":80") and parsed.scheme == "http"):
+                nl = nl.rsplit(":", 1)[0]
+            return nl
+        return _normalize_netloc(url) == _normalize_netloc(base_domain)
     except Exception:
         return False
 

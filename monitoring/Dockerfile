@@ -13,12 +13,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+COPY main.py ./
 RUN uv export --frozen --no-dev --no-emit-project -o requirements.txt \
     && uv pip install --system --no-cache -r requirements.txt \
     && uv pip install --system --no-cache .
-
-COPY src ./src
-COPY main.py ./
 
 # ─── runtime: minimal image ───
 FROM python:3.12-slim AS runtime

@@ -251,13 +251,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && pip install --no-cache-dir uv
 
 WORKDIR /build
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
+COPY src ./src
+COPY main.py ./
 RUN uv export --frozen --no-dev --no-emit-project -o requirements.txt \
     && uv pip install --system --no-cache -r requirements.txt \
     && uv pip install --system --no-cache .
-
-COPY src ./src
-COPY main.py ./
 
 # ─── runtime ───
 FROM python:3.12-slim AS runtime
