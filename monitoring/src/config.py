@@ -7,6 +7,21 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: str
     TELEGRAM_ADMIN_IDS: list[int] = []  # Initial admins defined in env
 
+    # Telegram live log (message that rewrites itself during a parsing run)
+    TELEGRAM_LIVE_LOG: bool = True  # master switch; False = old behaviour
+    TELEGRAM_LIVE_LOG_INTERVAL: float = 3.0  # seconds between edit attempts
+    TELEGRAM_LIVE_LOG_LEVEL: str = "INFO"  # mirrors the terminal stderr sink
+    TELEGRAM_LIVE_LOG_MIN_GAP: float = 1.05  # hard floor between 2 API calls
+    TELEGRAM_LIVE_LOG_BUFFER: int = 2000  # in-memory log ring buffer size
+    TELEGRAM_LIVE_LOG_DENY: list[str] = [
+        # Logger names never mirrored into Telegram (avoids edit->log->edit loops)
+        "aiogram",
+        "aiohttp",
+        "asyncio",
+        "apscheduler",
+        "src.services.bot.livelog",
+    ]
+
     # Ollama / AI
     AI_PROVIDER: str = "deepseek"  # "ollama" or "deepseek"
     AI_API_KEY: str = None

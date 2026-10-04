@@ -8,6 +8,7 @@ import re
 
 from src.config import settings
 from src.storage import db
+from src.services.bot.livelog import LiveLogMessage, RunProgress, get_buffer
 from src.services.bot.keyboards import (
     main_menu_keyboard,
     users_list_inline_keyboard,
@@ -22,6 +23,9 @@ from src.services.gsheets import gsheets_service
 bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
+
+# One parsing run at a time -- two runs would fight over the same live message.
+_run_lock = asyncio.Lock()
 
 
 # FSM States
@@ -98,8 +102,12 @@ async def cmd_manual_parse(message: types.Message):
         await message.answer("⛔ Доступ запрещен.")
         return
 
-    # Run in background to not block bot
-    asyncio.create_task(run_parsing_job())
+    if _run_lock.locked():
+        await message.answer("⏳ Парсинг уже идёт, дождись окончания.")
+        return
+
+    # Run in background to not block bot. The live log message is the reply.
+    asyncio.create_task(run_parsing_job(chat_id=message.chat.id))
 
 
 @router.message(F.text == "👥 Пользователи")
@@ -274,18 +282,70 @@ async def broadcast_notification(text: str):
                 )  # Default parse_mode
             except Exception as e2:
                 logger.error(f"Failed to send plain text to {uid}: {e2}")
+        # Different chats, so this only protects the global ~30 msg/s budget.
+        await asyncio.sleep(0.35)
 
 
-async def run_parsing_job():
-    """Wrapper to run the monitor service and notify about start/finish."""
-    logger.info("Manual parsing triggered.")
-    await broadcast_notification("🔄 Запущен поиск обновлений...")
+async def run_parsing_job(chat_id: int | None = None) -> bool:
+    """
+    Runs the monitor service once.
+
+    With ``chat_id`` the run reports into a single self-updating live log
+    message in that chat (one editor, one chat, no flood risk). Without it
+    (08:00 cron) it behaves exactly as before: plain start/finish broadcasts.
+    Returns False if a run is already in progress.
+    """
+    if _run_lock.locked():
+        logger.warning("Parsing job skipped: a run is already in progress.")
+        return False
+
+    async with _run_lock:
+        await _run_locked(chat_id)
+    return True
+
+
+async def _run_locked(chat_id: int | None) -> None:
+    live: LiveLogMessage | None = None
+    logger.info(
+        "Manual parsing triggered." if chat_id is not None else "Scheduled parsing triggered."
+    )
+
+    if chat_id is not None and settings.TELEGRAM_LIVE_LOG:
+        live = LiveLogMessage(
+            bot,
+            chat_id,
+            get_buffer(),
+            RunProgress(),
+            interval=settings.TELEGRAM_LIVE_LOG_INTERVAL,
+            min_gap=settings.TELEGRAM_LIVE_LOG_MIN_GAP,
+            chat_type="private",
+        )
+        try:
+            await live.start()
+        except Exception as e:
+            logger.warning(f"Live log unavailable, falling back: {e}")
+            live = None
+
+    if live is None:
+        await broadcast_notification("🔄 Запущен поиск обновлений...")
+
+    ok = False
     try:
-        await monitor_service.run_check_cycle()
-        await broadcast_notification("✅ Поиск завершен.")
+        await monitor_service.run_check_cycle(progress=live.progress if live else None)
+        ok = True
     except Exception as e:
         logger.error(f"Parsing job failed: {e}")
         await broadcast_notification(f"⚠️ Ошибка при парсинге: {e}")
+    finally:
+        if live is not None:
+            try:
+                await live.stop()
+            except Exception as e:
+                logger.warning(f"Live log final update failed: {e}")
+        elif chat_id is None:
+            await broadcast_notification(
+                "✅ Поиск завершен." if ok else "⚠️ Парсинг прерван."
+            )
 
 
 async def run_startup_job():

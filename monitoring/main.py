@@ -7,6 +7,7 @@ import pytz
 
 from src.config import settings
 from src.storage import db
+from src.services.bot.livelog import get_buffer, install_sink
 from src.services.bot.main import dp, bot, run_parsing_job, run_startup_job
 
 
@@ -41,11 +42,20 @@ async def main():
     # asyncio.create_task(run_startup_job())
 
     # Start Bot Polling
-    # We await this as it blocks (keeps the event loop running)
-    try:
-        await dp.start_polling(bot)
-    except Exception as e:
-        logger.error(f"Bot polling failed: {e}")
+    # We await this as it blocks (keeps the event loop running).
+    # A transient network reset must not kill the whole process -- that would
+    # take the 08:00 scheduler down with it. Retry with capped backoff instead.
+    backoff = 5.0
+    while True:
+        try:
+            await dp.start_polling(bot)
+            break  # polling stopped cleanly (shutdown requested)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Bot polling failed: {e} — retry in {backoff:.0f}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60.0)
 
 
 if __name__ == "__main__":
@@ -53,6 +63,15 @@ if __name__ == "__main__":
     logger.remove()
     logger.add(sys.stderr, level="INFO")
     logger.add("logs/app.log", rotation="1 day", level="DEBUG")
+
+    # Mirror the terminal stream into a buffer the Telegram live log renders.
+    # No-op when TELEGRAM_LIVE_LOG=false.
+    install_sink(
+        get_buffer(),
+        level=settings.TELEGRAM_LIVE_LOG_LEVEL,
+        enabled=settings.TELEGRAM_LIVE_LOG,
+        deny=settings.TELEGRAM_LIVE_LOG_DENY,
+    )
 
     try:
         # Check critical config early

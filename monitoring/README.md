@@ -49,6 +49,26 @@ docker run -d --name competitor-monitor \
 
 `logs/app.log` is rotated daily by loguru. View with `tail -f logs/app.log`.
 
+While a manual run is in progress, the bot also mirrors that log into a **single
+self-updating Telegram message** in the chat that pressed "🚀 Начать парсинг": a
+progress header (`3/9`, elapsed, ✅/❌ counters), a `✅ / ❌ / ⏳ / ⏸️` line per
+competitor with the failure reason, and the tail of the log lines. The message is
+rewritten with `editMessageText`, so no new message is created per update.
+
+Telegram allows ~1 message/second per chat, so edits are throttled and identical
+renders are never sent. A shop that fails no longer aborts the run — the cycle
+reports it as `❌` and moves on. 08:00 cron runs are unchanged (no live message).
+
+Tunable via `.env` (all optional):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TELEGRAM_LIVE_LOG` | `true` | Master switch; `false` restores the old behaviour |
+| `TELEGRAM_LIVE_LOG_INTERVAL` | `3.0` | Seconds between edit attempts |
+| `TELEGRAM_LIVE_LOG_LEVEL` | `INFO` | loguru level mirrored into Telegram |
+| `TELEGRAM_LIVE_LOG_MIN_GAP` | `1.05` | Hard floor between two API calls to the same chat |
+| `TELEGRAM_LIVE_LOG_BUFFER` | `2000` | In-memory log ring buffer size |
+
 ## Data
 
 `data/tracker.db` (sqlitedict) — single source of truth for known URLs per

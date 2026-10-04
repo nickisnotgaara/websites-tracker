@@ -1,5 +1,5 @@
 import asyncio
-from typing import List, Set
+from typing import TYPE_CHECKING, List, Optional, Set
 from urllib.parse import urlparse, urlunparse
 from loguru import logger
 import re
@@ -9,6 +9,9 @@ from src.storage import db
 from src.services import discovery
 from src.services.ai import ai_service
 from src.services.gsheets import gsheets_service
+
+if TYPE_CHECKING:
+    from src.services.bot.livelog import RunProgress
 
 
 def clean_html(text: str) -> str:
@@ -116,9 +119,12 @@ class MonitorService:
     def __init__(self, notification_callback=None):
         self.notification_callback = notification_callback
 
-    async def check_competitor(self, domain_url: str):
+    async def check_competitor(self, domain_url: str) -> dict:
         """
         Full check cycle with Smart Batching.
+
+        Returns a status dict for the caller (and the live Telegram log):
+        {"status": "ok" | "failed" | "skipped", "new_urls": int, "error": str | None}
         """
         normalized_domain = normalize_url(domain_url)
         logger.info(f"Starting check for {normalized_domain}")
@@ -143,10 +149,11 @@ class MonitorService:
             )
 
         if not curr_urls_raw:
+            error = "0 URLs discovered after 2 attempts"
             logger.error(
                 f"No URLs discovered for {domain_url} after retry. Skipping."
             )
-            return
+            return {"status": "failed", "new_urls": 0, "error": error}
 
         current_map = {normalize_url(u) for u in curr_urls_raw}
 
@@ -157,14 +164,18 @@ class MonitorService:
             )
             db.update_known_urls(normalized_domain, current_map)
             # Log silent init to GSheets if needed, or skip
-            return
+            return {
+                "status": "skipped",
+                "new_urls": 0,
+                "error": None,
+            }
 
         # 4. Update Phase
         new_urls = current_map - known_map
 
         if not new_urls:
             logger.info(f"No new pages found for {domain_url}")
-            return
+            return {"status": "ok", "new_urls": 0, "error": None}
 
         logger.info(f"Found {len(new_urls)} raw new URLs for {domain_url}")
 
@@ -236,11 +247,16 @@ class MonitorService:
         if db_save_set:
             db.update_known_urls(normalized_domain, db_save_set)
 
-    async def run_check_cycle(self):
+        return {"status": "ok", "new_urls": len(new_urls), "error": None}
+
+    async def run_check_cycle(self, progress: Optional["RunProgress"] = None):
         """
         Main Loop:
         1. Fetch competitors from Google Sheets.
         2. Iterate and check each.
+
+        A shop that raises is logged, reported as failed, and the cycle
+        continues -- one broken competitor must not kill the whole run.
         """
         logger.info("Fetching competitors from Google Sheets...")
         competitors = await asyncio.to_thread(gsheets_service.get_competitors)
@@ -251,8 +267,29 @@ class MonitorService:
 
         logger.info(f"Found {len(competitors)} competitors to check.")
 
+        if progress is not None:
+            progress.set_total(len(competitors))
+
         for domain in competitors:
-            await self.check_competitor(domain)
+            if progress is not None:
+                progress.begin(domain)
+            try:
+                result = await self.check_competitor(domain)
+            except Exception as e:
+                logger.exception(f"Check failed for {domain}: {e}")
+                if progress is not None:
+                    progress.finish(domain, "failed", 0, f"{type(e).__name__}: {e}")
+                continue
+            if progress is not None:
+                progress.finish(
+                    domain,
+                    result.get("status", "ok"),
+                    result.get("new_urls", 0),
+                    result.get("error"),
+                )
+
+        if progress is not None:
+            progress.finish_run()
 
 
 monitor_service = MonitorService()
