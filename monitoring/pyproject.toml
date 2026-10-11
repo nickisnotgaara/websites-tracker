@@ -20,6 +20,7 @@ dependencies = [
     "google-auth-oauthlib>=1.2.4",
     "trafilatura>=2.0.0",
     "selectolax>=0.3.0",
+    "requests>=2.32.0",
 ]
 
 [build-system]

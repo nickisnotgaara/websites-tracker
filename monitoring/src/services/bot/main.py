@@ -8,7 +8,7 @@ import re
 
 from src.config import settings
 from src.storage import db
-from src.services.bot.livelog import LiveLogMessage, RunProgress, get_buffer
+from src.services.bot.livelog import LiveRunPublisher, get_buffer
 from src.services.bot.keyboards import (
     main_menu_keyboard,
     users_list_inline_keyboard,
@@ -290,10 +290,10 @@ async def run_parsing_job(chat_id: int | None = None) -> bool:
     """
     Runs the monitor service once.
 
-    With ``chat_id`` the run reports into a single self-updating live log
-    message in that chat (one editor, one chat, no flood risk). Without it
-    (08:00 cron) it behaves exactly as before: plain start/finish broadcasts.
-    Returns False if a run is already in progress.
+    ``chat_id`` only says *who pressed the button* (used for the "already
+    running" reply). Observability no longer depends on it: every authorized
+    admin gets their own live-updating message, on a manual run and on the
+    08:00 cron alike. Returns False if a run is already in progress.
     """
     if _run_lock.locked():
         logger.warning("Parsing job skipped: a run is already in progress.")
@@ -305,44 +305,51 @@ async def run_parsing_job(chat_id: int | None = None) -> bool:
 
 
 async def _run_locked(chat_id: int | None) -> None:
-    live: LiveLogMessage | None = None
+    manual = chat_id is not None
     logger.info(
-        "Manual parsing triggered." if chat_id is not None else "Scheduled parsing triggered."
+        "Manual parsing triggered." if manual else "Scheduled parsing triggered."
     )
 
-    if chat_id is not None and settings.TELEGRAM_LIVE_LOG:
-        live = LiveLogMessage(
-            bot,
-            chat_id,
-            get_buffer(),
-            RunProgress(),
-            interval=settings.TELEGRAM_LIVE_LOG_INTERVAL,
-            min_gap=settings.TELEGRAM_LIVE_LOG_MIN_GAP,
-            chat_type="private",
-        )
+    publisher: LiveRunPublisher | None = None
+    if settings.TELEGRAM_LIVE_LOG:
         try:
-            await live.start()
+            publisher = LiveRunPublisher(
+                bot,
+                db.get_users(),
+                interval=settings.TELEGRAM_LIVE_LOG_INTERVAL,
+                min_gap=settings.TELEGRAM_LIVE_LOG_MIN_GAP,
+            )
+            publisher.progress.trigger = (
+                "ручной запуск" if manual else "по расписанию, 08:00 МСК"
+            )
+            await publisher.start()
         except Exception as e:
             logger.warning(f"Live log unavailable, falling back: {e}")
-            live = None
+            publisher = None
 
-    if live is None:
+    if publisher is None:
         await broadcast_notification("🔄 Запущен поиск обновлений...")
 
     ok = False
     try:
-        await monitor_service.run_check_cycle(progress=live.progress if live else None)
+        await monitor_service.run_check_cycle(
+            progress=publisher.progress if publisher else None
+        )
         ok = True
     except Exception as e:
         logger.error(f"Parsing job failed: {e}")
+        # Render the reason into every admin's message too -- otherwise a run
+        # that dies on the very first step leaves "Запускаю парсинг…" forever.
+        if publisher is not None:
+            publisher.fail_run(str(e))
         await broadcast_notification(f"⚠️ Ошибка при парсинге: {e}")
     finally:
-        if live is not None:
+        if publisher is not None:
             try:
-                await live.stop()
+                await publisher.stop()
             except Exception as e:
                 logger.warning(f"Live log final update failed: {e}")
-        elif chat_id is None:
+        elif not manual:
             await broadcast_notification(
                 "✅ Поиск завершен." if ok else "⚠️ Парсинг прерван."
             )

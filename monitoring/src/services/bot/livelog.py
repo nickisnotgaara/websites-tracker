@@ -133,12 +133,19 @@ class ShopStatus:
     error: str | None = None
     duration: float = 0.0
     started_at: float | None = None
+    fail_code: str | None = None
+    http_status: int | None = None
+    sheet_mark: bool = False  # operator wrote "не партся" in the sheet (display only)
+    truncated: bool = False  # hit the sitemap URL cap
+    fails_streak: int = 0
+    last_ok_at: float | None = None
 
 
 class RunProgress:
     """Per-run structured state. Single-writer (the parsing coroutine)."""
 
     def __init__(self) -> None:
+        self.trigger: str = ""  # "ручной" | "по расписанию" — survives reset
         self.reset()
 
     def reset(self) -> None:
@@ -148,17 +155,22 @@ class RunProgress:
         self.started_at = time.monotonic()
         self.finished_at: float | None = None
         self.shops: list[ShopStatus] = []
+        self.run_error: str | None = None
+        self.dead: list[ShopStatus] = []
+        # `trigger` is set by the caller *before* start() (manual vs cron), so
+        # it deliberately survives a reset.
 
     # -- mutators ---------------------------------------------------------
     def set_total(self, total: int) -> None:
         self.total = int(total)
 
-    def begin(self, url: str) -> ShopStatus:
+    def begin(self, url: str, *, sheet_mark: bool = False) -> ShopStatus:
         self.current = url
         self.index = len(self.shops) + 1
         shop = self._slot(url)
         shop.state = "running"
         shop.started_at = time.monotonic()
+        shop.sheet_mark = sheet_mark
         return shop
 
     def finish(
@@ -167,11 +179,22 @@ class RunProgress:
         state: str,
         new_urls: int = 0,
         error: str | None = None,
+        *,
+        fail_code: str | None = None,
+        http_status: int | None = None,
+        truncated: bool = False,
+        fails_streak: int = 0,
+        last_ok_at: float | None = None,
     ) -> ShopStatus:
         shop = self._slot(url)
         shop.state = state
         shop.new_urls = new_urls
         shop.error = error
+        shop.fail_code = fail_code
+        shop.http_status = http_status
+        shop.truncated = truncated
+        shop.fails_streak = fails_streak
+        shop.last_ok_at = last_ok_at
         if shop.started_at is not None:
             shop.duration = time.monotonic() - shop.started_at
         if url == self.current:
@@ -208,6 +231,14 @@ class RunProgress:
         return sum(s.new_urls for s in self.shops if s.state == "ok")
 
     @property
+    def marked_count(self) -> int:
+        return sum(1 for s in self.shops if s.sheet_mark)
+
+    @property
+    def truncated_count(self) -> int:
+        return sum(1 for s in self.shops if s.truncated)
+
+    @property
     def elapsed(self) -> float:
         return (self.finished_at or time.monotonic()) - self.started_at
 
@@ -218,7 +249,10 @@ class RunProgress:
         copy.current = self.current
         copy.started_at = self.started_at
         copy.finished_at = self.finished_at
+        copy.run_error = self.run_error
+        copy.trigger = self.trigger
         copy.shops = [ShopStatus(**vars(s)) for s in self.shops]
+        copy.dead = [ShopStatus(**vars(s)) for s in self.dead]
         return copy
 
 
@@ -242,7 +276,12 @@ def _fmt_duration(seconds: float) -> str:
 def _header(progress: RunProgress) -> str:
     total = progress.total or len(progress.shops)
     done = progress.finished_at is not None
-    title = "✅ <b>Парсинг завершён</b>" if done else "🩺 <b>Парсинг конкурентов</b>"
+    if progress.run_error:
+        title = "⛔ <b>Парсинг прерван</b>"
+    elif done:
+        title = "✅ <b>Парсинг завершён</b>"
+    else:
+        title = "🩺 <b>Парсинг конкурентов</b>"
     if total:
         title += f" · {progress.index or len(progress.shops)}/{total}"
     if progress.current:
@@ -254,7 +293,8 @@ def _header(progress: RunProgress) -> str:
         counters += f" · ⏭️ {progress.skipped_count}"
     if progress.total_new:
         counters += f" · 🆕 {progress.total_new}"
-    return f"{title}\n⏱ {_fmt_duration(progress.elapsed)}   {counters}"
+    tail = "   " + progress.trigger if progress.trigger else ""
+    return f"{title}\n⏱ {_fmt_duration(progress.elapsed)}   {counters}{tail}"
 
 
 def _shop_line(shop: ShopStatus) -> str:
@@ -264,14 +304,37 @@ def _shop_line(shop: ShopStatus) -> str:
         detail = f"{shop.new_urls} новых" if shop.new_urls else "без новых"
     elif shop.state == "failed":
         detail = html.escape(shop.error or "ошибка")
+        if shop.http_status and f"{shop.http_status}" not in detail:
+            detail += f" (HTTP {shop.http_status})"
     elif shop.state == "running":
         detail = "сканирую…"
     elif shop.state == "skipped":
         detail = "первый запуск, база заполнена"
     else:
         detail = "ждёт"
+    if shop.truncated:
+        detail += " · много URL"
     duration = f" ({_fmt_duration(shop.duration)})" if shop.duration >= 1 else ""
-    return f"{icon} {name} — {detail}{duration}"
+    # ⛔ = the operator marked it "не партся" in the sheet. Display only.
+    mark = " ⛔" if shop.sheet_mark else ""
+    return f"{icon} {name} — {detail}{duration}{mark}"
+
+
+def _dead_section(progress: RunProgress, max_lines: int = 8) -> str:
+    """Sites that failed N runs in a row — the actionable shortlist."""
+    if not progress.dead:
+        return ""
+    shown = progress.dead[-max_lines:]
+    lines = [f"⚠️ <b>Падают подряд:</b> {len(progress.dead)}"]
+    for shop in shown:
+        since = ""
+        if shop.last_ok_at:
+            since = f" (успех {time.strftime('%d.%m', time.localtime(shop.last_ok_at))})"
+        detail = html.escape(shop.error or shop.fail_code or "ошибка")
+        lines.append(f" • {html.escape(_short_url(shop.url))} — {detail}{since}")
+    if len(progress.dead) > len(shown):
+        lines.insert(1, f"… ещё {len(progress.dead) - len(shown)}")
+    return "\n".join(lines)
 
 
 def _shop_selection(
@@ -309,11 +372,18 @@ def _compose(
 ) -> str:
     blocks = [_header(progress)]
 
+    if progress.run_error:
+        blocks.append(f"❗ {html.escape(progress.run_error)}")
+
     if progress.shops:
         lines = [_shop_line(s) for s in shown]
         if hidden:
             lines.insert(0, f"… ещё {hidden} магазинов (ошибки — вверху)")
         blocks.append("<b>Магазины:</b>\n" + "\n".join(lines))
+
+    dead = _dead_section(progress)
+    if dead:
+        blocks.append(dead)
 
     if tail_lines:
         label = "<b>Логи:</b>"
@@ -386,6 +456,7 @@ class LiveLogMessage:
         chat_type: str = "private",
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Any] = asyncio.sleep,
+        own_loop: bool = True,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -398,6 +469,10 @@ class LiveLogMessage:
         )
         self.min_gap = min_gap
         self.chat_type = chat_type
+        # own_loop=False => a LiveRunPublisher drives this chat and owns the
+        # render/tick, so N chats cost one render instead of N.
+        self.own_loop = own_loop
+        self.is_active = True
 
         self._clock = clock
         self._sleep = sleep
@@ -408,12 +483,16 @@ class LiveLogMessage:
         self._broken = False
         self._penalty = 1
         self._seen_errors: set[str] = set()
+        self.message_id: int | None = None
 
     # -- lifecycle --------------------------------------------------------
-    async def start(self) -> int:
-        """Send the message and start the refresh task. Returns message_id."""
-        self.buffer.clear()
-        self.progress.reset()
+    async def start(self, *, reset: bool | None = None) -> int:
+        """Send the message and (if own_loop) start the refresh task."""
+        if reset is None:
+            reset = self.own_loop
+        if reset:
+            self.buffer.clear()
+            self.progress.reset()
         placeholder = "🩺 Запускаю парсинг…"
         # aiogram's contract: send_message(chat_id, text, ...) -- chat_id FIRST.
         # (edit_message_text is the other way round; see _edit.)
@@ -423,7 +502,8 @@ class LiveLogMessage:
         self.message_id = sent.message_id
         self._last_text = placeholder
         self._last_call = self._clock()
-        self._task = asyncio.create_task(self._loop())
+        if self.own_loop:
+            self._task = asyncio.create_task(self._loop())
         return self.message_id
 
     async def _loop(self) -> None:
@@ -447,7 +527,7 @@ class LiveLogMessage:
                 pass
             except Exception:
                 pass
-        if self._broken or getattr(self, "message_id", None) is None:
+        if self._broken or not self.is_active or self.message_id is None:
             return
         text = final_text or render(self.progress, self.buffer)
         if text == self._last_text:
@@ -461,11 +541,19 @@ class LiveLogMessage:
         except Exception as exc:
             await self._handle_error(exc, text)
 
+    async def publish(self, text: str | None = None) -> None:
+        """Push the current state to this chat (used by LiveRunPublisher)."""
+        await self._flush(pre_rendered=text)
+
     # -- internals --------------------------------------------------------
-    async def _flush(self) -> None:
-        if self._broken or getattr(self, "message_id", None) is None:
+    async def _flush(self, pre_rendered: str | None = None) -> None:
+        if self._broken or not self.is_active or self.message_id is None:
             return
-        text = render(self.progress, self.buffer)
+        text = (
+            pre_rendered
+            if pre_rendered is not None
+            else render(self.progress, self.buffer)
+        )
         if text == self._last_text:
             return  # no-op edit is a 400 on Telegram
         await self._gate()
@@ -546,6 +634,144 @@ class LiveLogMessage:
 
     def _note_error(self, context: str, exc: Exception) -> None:
         """Log once per distinct error -- the sink filters our own records."""
+        key = f"{context}:{type(exc).__name__}:{exc}"
+        if key in self._seen_errors:
+            return
+        self._seen_errors.add(key)
+        logger.warning(f"{context}: {type(exc).__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Fan-out publisher: one run, many admins
+# --------------------------------------------------------------------------
+class LiveRunPublisher:
+    """Owns one run's live view and mirrors it into every admin chat.
+
+    The run publishes state; admins are subscribers. Neither the trigger
+    (button vs 08:00 cron) nor the admin list is baked into the message
+    owner, which is what previously made scheduled runs silent.
+
+    The text is rendered **once** per tick and the same string is pushed to
+    every chat, so N admins cost one render and N throttled edits.
+    """
+
+    _SUBSCRIBER_GAP = 0.35  # same pacing as broadcast_notification()
+
+    def __init__(
+        self,
+        bot: Any,
+        subscribers: Sequence[int],
+        *,
+        buffer: LogBuffer | None = None,
+        progress: RunProgress | None = None,
+        interval: float = _PRIVATE_INTERVAL,
+        min_gap: float = _HARD_MIN_GAP,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], Any] = asyncio.sleep,
+        loop_sleep: Callable[[float], Any] | None = None,
+    ) -> None:
+        self.bot = bot
+        self.buffer = buffer if buffer is not None else get_buffer()
+        self.progress = progress if progress is not None else RunProgress()
+        self.interval = interval
+        self.min_gap = min_gap
+        self._clock = clock
+        self._sleep = sleep
+        # The tick cadence is a separate injectable from the send throttle:
+        # tests park the loop so only they drive tick(), while retry_after /
+        # min_gap waits inside LiveLogMessage must still go through `sleep`.
+        # Folding them into one callable makes a parked loop-sleep swallow
+        # error-handling waits too, which hangs the run instead of the test.
+        self._loop_sleep = loop_sleep if loop_sleep is not None else sleep
+
+        seen: set[int] = set()
+        self.subscribers: dict[int, LiveLogMessage] = {}
+        self._order: list[int] = []
+        for chat_id in subscribers or ():
+            if chat_id in seen:
+                continue
+            seen.add(chat_id)
+            self._order.append(chat_id)
+            self.subscribers[chat_id] = LiveLogMessage(
+                bot,
+                chat_id,
+                self.buffer,
+                self.progress,
+                min_gap=min_gap,
+                clock=clock,
+                sleep=sleep,
+                own_loop=False,
+            )
+
+        self._task: asyncio.Task | None = None
+        self._last_text = ""
+        self._penalty = 1
+        self._seen_errors: set[str] = set()
+
+    # -- lifecycle --------------------------------------------------------
+    async def start(self) -> None:
+        """Send one placeholder per admin, then start the shared tick."""
+        self.buffer.clear()
+        self.progress.reset()
+        for chat_id in self._order:
+            sub = self.subscribers[chat_id]
+            try:
+                await sub.start(reset=False)
+            except Exception as exc:
+                sub.is_active = False
+                self._note(f"subscriber {chat_id} start failed", exc)
+            await self._sleep(self._SUBSCRIBER_GAP)
+        self._task = asyncio.create_task(self._loop())
+
+    async def _loop(self) -> None:
+        while True:
+            await self._loop_sleep(self.interval * self._penalty)
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._note("publisher tick failed", exc)
+
+    async def tick(self) -> None:
+        """Render once, then push the same text to every healthy chat."""
+        text = render(self.progress, self.buffer)
+        if text == self._last_text:
+            return
+        alive = [s for s in self.subscribers.values() if s.is_active]
+        if not alive:
+            return
+        await asyncio.gather(
+            *(s.publish(text) for s in alive), return_exceptions=True
+        )
+        self._last_text = text
+
+    def fail_run(self, error: str) -> None:
+        """Make a run-level failure visible in every admin's message."""
+        self.progress.run_error = str(error)
+
+    async def stop(self, final_text: str | None = None) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        for chat_id in self._order:
+            sub = self.subscribers[chat_id]
+            if not sub.is_active:
+                continue
+            try:
+                await sub.stop(final_text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._note(f"subscriber {chat_id} final update failed", exc)
+
+    def _note(self, context: str, exc: Exception) -> None:
         key = f"{context}:{type(exc).__name__}:{exc}"
         if key in self._seen_errors:
             return

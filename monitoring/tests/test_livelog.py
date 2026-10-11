@@ -7,7 +7,9 @@ no extra dependency (no pytest-asyncio).
 import asyncio
 import sys
 import threading
+import time
 import types
+from dataclasses import dataclass
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from loguru import logger
@@ -15,12 +17,15 @@ from loguru import logger
 from src.services.bot.livelog import (
     TELEGRAM_TEXT_LIMIT,
     LiveLogMessage,
+    LiveRunPublisher,
     LogBuffer,
     RunProgress,
+    ShopStatus,
     _make_filter,
     install_sink,
     render,
 )
+from src.services.discovery.sitemap import DiscoveryResult
 
 
 # --- helpers -------------------------------------------------------------
@@ -127,9 +132,23 @@ def _load_monitor():
     real competitor spreadsheet.
     """
     if "src.services.gsheets" not in sys.modules:
+        # NOTE: never import the real module here -- it authenticates against
+        # Google at import time. A duck-typed stand-in is enough: the monitor
+        # only touches .url and .sheet_mark.
+        @dataclass
+        class CompetitorRow:
+            url: str
+            sheet_mark: bool = False
+
         stub = types.ModuleType("src.services.gsheets")
 
         class _StubGSheetsService:
+            def get_competitor_rows(self):
+                return [
+                    CompetitorRow(url=url, sheet_mark=url.endswith("bad.example"))
+                    for url in _STUB["competitors"]
+                ]
+
             def get_competitors(self):
                 return list(_STUB["competitors"])
 
@@ -145,6 +164,34 @@ def _load_monitor():
 
 
 _STUB = {"competitors": []}
+
+
+class _InMemoryHealthStore:
+    """Keeps the health DB out of the developer's real tracker.db."""
+
+    def __init__(self, *args, **kwargs):
+        self.data: dict = {}
+
+    def record_run(self, results, now=None):
+        for item in results:
+            url = item["url"]
+            rec = self.data.setdefault(url, {"fails_streak": 0, "runs": 0})
+            rec["runs"] += 1
+            if item.get("failed"):
+                rec["fails_streak"] += 1
+                rec["last_detail"] = item.get("detail")
+            else:
+                rec["fails_streak"] = 0
+                rec["last_detail"] = None
+                rec["last_ok_at"] = 1.0
+        return self.data
+
+    def dead(self, threshold=3):
+        return [
+            {"url": url, **rec}
+            for url, rec in self.data.items()
+            if rec.get("fails_streak", 0) >= threshold
+        ]
 
 
 # --- render: budget ------------------------------------------------------
@@ -489,11 +536,270 @@ def test_install_sink_disabled():
     assert install_sink(LogBuffer(maxlen=10), enabled=False) is None
 
 
+# --- run-level failure and dead-site shortlist ------------------------
+
+
+def test_run_error_is_rendered_instead_of_a_frozen_placeholder():
+    progress = RunProgress()
+    progress.run_error = "Google Sheets: Invalid JWT Signature — ключ отозван"
+    text = render(progress, LogBuffer(maxlen=10))
+    assert "Парсинг прерван" in text
+    assert "Invalid JWT Signature" in text
+
+
+def test_trigger_line_is_shown():
+    progress = RunProgress()
+    progress.trigger = "по расписанию, 08:00 МСК"
+    assert "по расписанию, 08:00 МСК" in render(progress, LogBuffer(maxlen=10))
+
+
+def test_dead_section_lists_streaking_sites():
+    progress = RunProgress()
+    progress.shops = [
+        ShopStatus(url="velana.ua", state="failed", error="сервер не отвечает",
+                   fails_streak=4, last_ok_at=time.time() - 86400 * 3),
+        ShopStatus(url="anthropologie.com", state="failed",
+                   error="403 — блокируют бота", fails_streak=3,
+                   last_ok_at=time.time() - 86400 * 9),
+    ]
+    progress.dead = list(progress.shops)
+    progress.finish_run()
+
+    text = render(progress, LogBuffer(maxlen=10))
+    assert "Падают подряд" in text
+    assert "velana.ua" in text
+    assert "сервер не отвечает" in text
+    assert "anthropologie.com" in text
+
+
+def test_sheet_mark_is_shown_without_changing_the_status():
+    progress = RunProgress()
+    progress.begin("https://berta.com", sheet_mark=True)
+    progress.finish("https://berta.com", "failed", 0, "403 — блокируют бота")
+    text = render(progress, LogBuffer(maxlen=10))
+    assert "⛔" in text
+    assert "❌" in text  # the mark is additive, not a replacement status
+    assert progress.marked_count == 1
+
+
+def test_http_status_is_appended_when_not_already_present():
+    progress = RunProgress()
+    progress.begin("https://x.example")
+    progress.finish("https://x.example", "failed", 0, "403 — блокируют бота",
+                    http_status=403)
+    text = render(progress, LogBuffer(maxlen=10))
+    assert text.count("403") == 1  # not duplicated
+
+    progress2 = RunProgress()
+    progress2.begin("https://y.example")
+    progress2.finish("https://y.example", "failed", 0, "таймаут ответа",
+                     http_status=503)
+    assert "HTTP 503" in render(progress2, LogBuffer(maxlen=10))
+
+
+def test_truncated_sites_are_flagged():
+    progress = RunProgress()
+    progress.begin("https://davidsbridal.com")
+    progress.finish("https://davidsbridal.com", "ok", 3, truncated=True)
+    text = render(progress, LogBuffer(maxlen=10))
+    assert "много URL" in text
+    assert progress.truncated_count == 1
+
+
+# --- LiveRunPublisher: one run, many admins -----------------------------
+
+
+class _ParkingSleep:
+    """Parks forever so only the test drives the publisher's tick loop.
+
+    With interval=0 and a yielding sleep the publisher's own loop would spin
+    and tick concurrently with a manual tick(), which is a test artefact, not
+    production behaviour (production sleeps 3 real seconds between ticks).
+
+    It is wired in as `loop_sleep` only. The send throttle keeps the fake
+    clock's sleep: retry_after / min_gap waits are real control flow and must
+    still complete (and be recorded), otherwise a blocked-chat test parks
+    inside error handling instead of asserting.
+    """
+
+    async def __call__(self, _seconds):
+        await asyncio.Event().wait()
+
+
+def _publisher(bot, chats=(1, 2, 3)):
+    clock = _FakeClock()
+    bot.clock = clock
+    return (
+        LiveRunPublisher(
+            bot,
+            list(chats),
+            buffer=LogBuffer(maxlen=200),
+            interval=0.0,
+            min_gap=0.0,
+            clock=clock,
+            sleep=clock.sleep,
+            loop_sleep=_ParkingSleep(),
+        ),
+        clock,
+    )
+
+
+def test_publisher_sends_one_message_per_admin():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 222, 333))
+
+    async def scenario():
+        await pub.start()
+        await pub.stop()
+
+    asyncio.run(scenario())
+    sends = [c for c in bot.calls if c["kind"] == "send"]
+    assert [c["chat_id"] for c in sends] == [111, 222, 333]
+
+
+def test_publisher_edits_every_subscriber_with_the_same_text():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 222))
+
+    async def scenario():
+        await pub.start()
+        pub.progress.set_total(2)
+        pub.progress.begin("https://a.example")
+        pub.buffer.append("line one")
+        await pub.tick()
+        await pub.stop()
+
+    asyncio.run(scenario())
+    edits = [c for c in bot.calls if c["kind"] == "edit"]
+    by_chat: dict = {}
+    for e in edits:
+        by_chat.setdefault(e["chat_id"], []).append(e["text"])
+    assert set(by_chat) == {111, 222}
+    assert by_chat[111][-1] == by_chat[222][-1]  # identical text
+    assert "line one" in by_chat[111][-1]
+
+
+def test_publisher_renders_once_per_tick_for_all_chats():
+    renders = {"n": 0}
+    import src.services.bot.livelog as livelog_mod
+
+    original = livelog_mod.render
+
+    def counting(progress, buffer, **kwargs):
+        renders["n"] += 1
+        return original(progress, buffer, **kwargs)
+
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 222, 333))
+
+    async def scenario():
+        await pub.start()
+        pub.buffer.append("only line")
+        renders["n"] = 0
+        livelog_mod.render = counting
+        try:
+            await pub.tick()
+        finally:
+            livelog_mod.render = original
+        await pub.stop()
+
+    asyncio.run(scenario())
+    assert renders["n"] == 1  # one render, three chats
+
+
+def test_publisher_skips_the_tick_when_nothing_changed():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 222))
+
+    async def scenario():
+        await pub.start()
+        await pub.tick()
+        first = len([c for c in bot.calls if c["kind"] == "edit"])
+        await pub.tick()  # no new log lines, no state change
+        second = len([c for c in bot.calls if c["kind"] == "edit"])
+        await pub.stop()
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert first == second
+
+
+def test_one_broken_subscriber_does_not_stop_the_others():
+    error = TelegramRetryAfter(
+        method=None, message="Too Many Requests: retry after 5", retry_after=5
+    )
+    bot = _FakeBot()
+    pub, clock = _publisher(bot, (111, 222))
+
+    original_edit = bot.edit_message_text
+
+    async def flaky(text, chat_id=None, message_id=None, parse_mode=None):
+        if chat_id == 111:
+            raise error
+        return await original_edit(
+            text, chat_id=chat_id, message_id=message_id, parse_mode=parse_mode
+        )
+
+    bot.edit_message_text = flaky
+
+    async def scenario():
+        await pub.start()
+        pub.buffer.append("shared line")
+        await pub.tick()
+        await pub.stop()
+
+    asyncio.run(scenario())
+
+    edits = [c for c in bot.calls if c["kind"] == "edit"]
+    assert [c["chat_id"] for c in edits] == [222]  # 222 was not blocked
+    assert any(s == 5.5 for s in clock.sleeps)  # retry_after + jitter
+
+
+def test_publisher_fail_run_shows_in_every_chat():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 222))
+
+    async def scenario():
+        await pub.start()
+        pub.fail_run("Google Sheets: отозван ключ")  # failure happens mid-run
+        await pub.tick()
+        await pub.stop()
+
+    asyncio.run(scenario())
+    edits = [c for c in bot.calls if c["kind"] == "edit"]
+    assert edits
+    for e in edits:
+        assert "отозван ключ" in e["text"]
+
+
+def test_publisher_keeps_the_trigger_set_before_start():
+    """trigger describes the run, so reset() must not wipe it."""
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111,))
+    pub.progress.trigger = "по расписанию, 08:00 МСК"
+
+    async def scenario():
+        await pub.start()
+        await pub.tick()
+        await pub.stop()
+
+    asyncio.run(scenario())
+    edits = [c for c in bot.calls if c["kind"] == "edit"]
+    assert "по расписанию" in edits[-1]["text"]
+
+
+def test_publisher_deduplicates_subscribers():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 111, 222))
+    assert list(pub.subscribers) == [111, 222]
+
+
 # --- monitor integration ------------------------------------------------
 
 
 def test_run_check_cycle_continues_after_site_failure(monkeypatch):
     monitor_module = _load_monitor()
+    monkeypatch.setattr(monitor_module, "ShopHealthStore", _InMemoryHealthStore)
     _STUB["competitors"] = [
         "https://a.example.com",
         "https://b.example.com",
@@ -521,7 +827,9 @@ def test_run_check_cycle_continues_after_site_failure(monkeypatch):
 def test_check_competitor_reports_zero_urls_as_failed(monkeypatch):
     monitor_module = _load_monitor()
     monkeypatch.setattr(
-        monitor_module.discovery, "discover_urls", lambda url, **kwargs: []
+        monitor_module.discovery,
+        "discover_urls_detailed",
+        lambda url, **kwargs: DiscoveryResult(urls=[], ok=False, code="dns", detail="домен не резолвится"),
     )
 
     async def no_sleep(_seconds):
@@ -534,5 +842,6 @@ def test_check_competitor_reports_zero_urls_as_failed(monkeypatch):
     )
 
     assert result["status"] == "failed"
-    assert "0 URLs" in result["error"]
+    assert result["fail_code"] == "dns"
+    assert result["error"] == "домен не резолвится"
     assert result["new_urls"] == 0

@@ -79,6 +79,20 @@ if __name__ == "__main__":
             logger.error("SPREADSHEET_ID is missing in config/env!")
             sys.exit(1)
 
+        # Prove Google auth really works before the 08:00 cron depends on it.
+        # _authenticate() only parses the key file, so a revoked key or a wrong
+        # system clock used to stay invisible until the first scheduled run.
+        try:
+            from src.services.gsheets import gsheets_service
+
+            ok, detail = gsheets_service.preflight()
+            if ok:
+                logger.info(detail)
+            else:
+                logger.error(f"Google Sheets preflight FAILED: {detail}")
+        except Exception as e:
+            logger.error(f"Google Sheets preflight could not run: {e}")
+
         # Windows selector loop policy fix
         if sys.platform == "win32":
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())

@@ -9,6 +9,7 @@ from src.storage import db
 from src.services import discovery
 from src.services.ai import ai_service
 from src.services.gsheets import gsheets_service
+from src.services.health import DEAD_AFTER_RUNS, ShopHealthStore
 
 if TYPE_CHECKING:
     from src.services.bot.livelog import RunProgress
@@ -134,28 +135,39 @@ class MonitorService:
         is_known_site = len(known_urls_raw) > 0
         known_map = {normalize_url(u) for u in known_urls_raw}
 
-        # 2. Map Site (discover_urls has its own retry+timeout; never raises).
+        # 2. Map Site (discover_urls_detailed has its own retry+timeout; never raises).
         # Outer 1-retry on empty result catches "200 with empty body" (deployment in progress, etc.)
-        curr_urls_raw = await asyncio.to_thread(
-            discovery.discover_urls, domain_url
+        discovery_result = await asyncio.to_thread(
+            discovery.discover_urls_detailed, domain_url
         )
-        if not curr_urls_raw:
+        if not discovery_result.urls:
             logger.warning(
                 f"No URLs discovered for {domain_url} on first attempt; retrying after 5s..."
             )
             await asyncio.sleep(5)
-            curr_urls_raw = await asyncio.to_thread(
-                discovery.discover_urls, domain_url
+            discovery_result = await asyncio.to_thread(
+                discovery.discover_urls_detailed, domain_url
             )
 
-        if not curr_urls_raw:
-            error = "0 URLs discovered after 2 attempts"
+        if not discovery_result.urls:
+            # Say *why*, not just that it failed: the taxonomy detail is what
+            # makes "домен мёртв" distinguishable from "нас блокируют".
             logger.error(
-                f"No URLs discovered for {domain_url} after retry. Skipping."
+                f"No URLs discovered for {domain_url} after retry "
+                f"[{discovery_result.code}]: {discovery_result.detail}"
             )
-            return {"status": "failed", "new_urls": 0, "error": error}
+            return {
+                "status": "failed",
+                "new_urls": 0,
+                "error": discovery_result.detail
+                or "0 URLs discovered after 2 attempts",
+                "fail_code": discovery_result.code,
+                "http_status": discovery_result.http_status,
+                "truncated": False,
+            }
 
-        current_map = {normalize_url(u) for u in curr_urls_raw}
+        current_map = {normalize_url(u) for u in discovery_result.urls}
+        truncated = discovery_result.truncated
 
         # 3. Init Phase
         if not is_known_site:
@@ -168,6 +180,9 @@ class MonitorService:
                 "status": "skipped",
                 "new_urls": 0,
                 "error": None,
+                "fail_code": None,
+                "http_status": None,
+                "truncated": truncated,
             }
 
         # 4. Update Phase
@@ -175,7 +190,14 @@ class MonitorService:
 
         if not new_urls:
             logger.info(f"No new pages found for {domain_url}")
-            return {"status": "ok", "new_urls": 0, "error": None}
+            return {
+                "status": "ok",
+                "new_urls": 0,
+                "error": None,
+                "fail_code": None,
+                "http_status": None,
+                "truncated": truncated,
+            }
 
         logger.info(f"Found {len(new_urls)} raw new URLs for {domain_url}")
 
@@ -247,7 +269,14 @@ class MonitorService:
         if db_save_set:
             db.update_known_urls(normalized_domain, db_save_set)
 
-        return {"status": "ok", "new_urls": len(new_urls), "error": None}
+        return {
+            "status": "ok",
+            "new_urls": len(new_urls),
+            "error": None,
+            "fail_code": None,
+            "http_status": None,
+            "truncated": truncated,
+        }
 
     async def run_check_cycle(self, progress: Optional["RunProgress"] = None):
         """
@@ -259,10 +288,22 @@ class MonitorService:
         continues -- one broken competitor must not kill the whole run.
         """
         logger.info("Fetching competitors from Google Sheets...")
-        competitors = await asyncio.to_thread(gsheets_service.get_competitors)
+        try:
+            competitors = await asyncio.to_thread(gsheets_service.get_competitor_rows)
+        except Exception as e:
+            # Recorded on the progress so the live message explains itself,
+            # then re-raised so the broadcast path still reports the failure.
+            logger.exception("Failed to fetch competitors from Google Sheets")
+            if progress is not None:
+                progress.run_error = f"Google Sheets: {e}"
+                progress.finish_run()
+            raise
 
         if not competitors:
             logger.warning("No competitors found in Google Sheets!")
+            if progress is not None:
+                progress.run_error = "В таблице нет ни одного сайта"
+                progress.finish_run()
             return
 
         logger.info(f"Found {len(competitors)} competitors to check.")
@@ -270,26 +311,69 @@ class MonitorService:
         if progress is not None:
             progress.set_total(len(competitors))
 
-        for domain in competitors:
+        outcomes: list[dict] = []
+        for row in competitors:
             if progress is not None:
-                progress.begin(domain)
+                progress.begin(row.url, sheet_mark=row.sheet_mark)
             try:
-                result = await self.check_competitor(domain)
+                result = await self.check_competitor(row.url)
             except Exception as e:
-                logger.exception(f"Check failed for {domain}: {e}")
+                logger.exception(f"Check failed for {row.url}: {e}")
+                detail = f"{type(e).__name__}: {e}"
+                outcomes.append(
+                    {"url": row.url, "failed": True, "code": "exception", "detail": detail}
+                )
                 if progress is not None:
-                    progress.finish(domain, "failed", 0, f"{type(e).__name__}: {e}")
+                    progress.finish(
+                        row.url, "failed", 0, detail, fail_code="exception"
+                    )
                 continue
+
+            failed = result.get("status") == "failed"
+            outcomes.append(
+                {
+                    "url": row.url,
+                    "failed": failed,
+                    "code": result.get("fail_code"),
+                    "detail": result.get("error"),
+                }
+            )
             if progress is not None:
                 progress.finish(
-                    domain,
+                    row.url,
                     result.get("status", "ok"),
                     result.get("new_urls", 0),
                     result.get("error"),
+                    fail_code=result.get("fail_code"),
+                    http_status=result.get("http_status"),
+                    truncated=result.get("truncated", False),
                 )
+
+        self._record_health(outcomes, progress)
 
         if progress is not None:
             progress.finish_run()
+
+    @staticmethod
+    def _record_health(outcomes: list[dict], progress) -> None:
+        """Persist streaks once per run and surface the dead-site shortlist."""
+        try:
+            store = ShopHealthStore()
+            store.record_run(outcomes)
+            if progress is None:
+                return
+            by_url = {s.url: s for s in progress.shops}
+            dead = []
+            for entry in store.dead(DEAD_AFTER_RUNS):
+                shop = by_url.get(entry["url"])
+                if shop is None:
+                    continue
+                shop.fails_streak = entry.get("fails_streak", 0)
+                shop.last_ok_at = entry.get("last_ok_at")
+                dead.append(shop)
+            progress.dead = dead
+        except Exception as e:
+            logger.warning(f"Health store update failed: {e}")
 
 
 monitor_service = MonitorService()
