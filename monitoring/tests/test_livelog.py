@@ -22,8 +22,10 @@ from src.services.bot.livelog import (
     RunProgress,
     ShopStatus,
     _make_filter,
+    _short_url,
     install_sink,
     render,
+    render_failure_report,
 )
 from src.services.discovery.sitemap import DiscoveryResult
 
@@ -311,7 +313,37 @@ def test_failed_shops_are_listed_before_ok_ones():
         assert f"shop-{i:02d}.example.com" in text
     assert "shop-29.example.com" in text
     assert "shop-20.example.com" not in text  # healthy tail dropped first
-    assert "ошибки — вверху" in text
+    # The cut line must not claim failures are all above: some can be below,
+    # and the follow-up report holds the complete list.
+    assert "полный список в отчёте об ошибках" in text
+    assert "ошибки — вверху" not in text
+
+
+def test_cut_line_states_how_many_failures_did_not_fit():
+    """Never let a failure disappear silently behind a misleading label."""
+    progress = RunProgress()
+    progress.set_total(400)
+    for i in range(400):
+        url = f"https://shop-{i:03d}.example.com"
+        progress.begin(url)
+        if i < 150:
+            progress.finish(url, "failed", 0, "403 — блокируют бота")
+        else:
+            progress.finish(url, "ok", 1)
+    progress.finish_run()
+
+    text = render(progress, LogBuffer(maxlen=10))
+    combined = text + "\n".join(render_failure_report(progress, LogBuffer(maxlen=10)))
+
+    # Count listed shop rows only -- the "Причины" summary repeats the reason
+    # text once and would throw the count off by one.
+    listed = sum(1 for line in text.splitlines() if line.startswith("❌ "))
+    hidden_failures = 150 - listed
+    assert hidden_failures > 0, "scenario must actually overflow"
+    assert f"из них {hidden_failures} с ошибками" in text
+    # ...and every one of them is recoverable from the report message.
+    for i in range(150):
+        assert f"shop-{i:03d}.example.com" in combined
 
 
 def test_finished_report_lists_every_failure():
@@ -845,3 +877,165 @@ def test_check_competitor_reports_zero_urls_as_failed(monkeypatch):
     assert result["fail_code"] == "dns"
     assert result["error"] == "домен не резолвится"
     assert result["new_urls"] == 0
+
+
+# --- failure report: every failed site must be visible ------------------
+#
+# The bug this guards: with 50+ failures the single live message ran out of
+# characters and dropped sites *silently*, so the user could not see which
+# sites to investigate. The report is the fix, so the invariant is "no
+# failure disappears anywhere in the output".
+
+
+def _run_with_failures(fails, ok_count=250):
+    """Build a finished run: `fails` is [(url, reason, http_status)]."""
+    buffer = LogBuffer(maxlen=2000)
+    progress = RunProgress()
+    progress.trigger = "ручной запуск"
+    progress.set_total(len(fails) + ok_count)
+    for url, reason, status in fails:
+        progress.begin(url)
+        progress.finish(url, "failed", error=reason, http_status=status)
+    for i in range(ok_count):
+        url = f"https://salon-{i:03d}.example"
+        progress.begin(url)
+        progress.finish(url, "ok", new_urls=2)
+    for i in range(400):  # INFO spam, as a real run produces
+        buffer.append(f"16:0{i % 10}:01 | INFO     | check_competitor:{i} - page {i}")
+    progress.finish_run()
+    return progress, buffer
+
+
+def _many_failures(count=55):
+    real = [
+        ("https://shlomitazrad.com", "таймаут ответа", None),
+        ("https://instagram.com/ronalinabridal", "главная без ссылок (JS-сайт)", 200),
+        ("https://saintbridalcouture.com", "403 — блокируют бота", 403),
+        ("https://agnesfashiongroup.com", "ошибка TLS/сертификата", None),
+        ("https://candelasyfelipa.es", "429 — нас ограничивают", 429),
+    ]
+    fails = list(real)
+    fails += [
+        (f"https://boutique-{i:02d}.co.uk", "403 — блокируют бота", 403)
+        for i in range(count - len(real))
+    ]
+    return fails
+
+
+def test_report_shows_every_failed_site_for_a_realistic_run():
+    fails = _many_failures()
+    progress, buffer = _run_with_failures(fails)
+
+    chunks = render_failure_report(progress, buffer)
+    combined = "\n".join(chunks)
+
+    missing = [
+        url
+        for url, _, _ in fails
+        if _short_url(url) not in combined
+    ]
+    assert not missing, f"failed sites invisible to the user: {missing}"
+    assert len(chunks) >= 1
+
+
+def test_report_never_exceeds_the_telegram_limit():
+    fails = _many_failures(200)  # pathological: forces the multi-message path
+    progress, buffer = _run_with_failures(fails)
+    for chunk in render_failure_report(progress, buffer):
+        assert len(chunk) <= TELEGRAM_TEXT_LIMIT
+
+
+def test_report_fits_a_realistic_run_into_a_single_message():
+    fails = _many_failures()
+    progress, buffer = _run_with_failures(fails)
+    assert len(render_failure_report(progress, buffer)) == 1
+
+
+def test_report_groups_repeated_reasons_instead_of_repeating_them():
+    """45 identical rows carry one bit; the grouped form does not hide sites."""
+    fails = _many_failures()
+    progress, buffer = _run_with_failures(fails)
+    text = "\n".join(render_failure_report(progress, buffer))
+
+    assert "403 — блокируют бота" in text
+    assert "таймаут ответа" in text
+    assert "instagram.com/ronalinabridal" in text  # listed, not just counted
+
+
+def test_report_is_empty_when_nothing_failed():
+    progress, buffer = _run_with_failures([], ok_count=10)
+    assert render_failure_report(progress, buffer) == []
+
+
+def test_main_message_carries_the_reason_summary():
+    fails = _many_failures()
+    progress, buffer = _run_with_failures(fails)
+    text = render(progress, buffer)
+
+    assert "Причины:" in text
+    assert "403 — блокируют бота" in text
+
+
+def test_report_prefers_warning_logs_over_info_spam():
+    fails = [("https://a.example.com", "403 — блокируют бота", 403)]
+    progress, buffer = _run_with_failures(fails)
+    for i in range(200):
+        buffer.append(f"16:00:01 | INFO     | noop:{i} - noise")
+    buffer.append("16:00:02 | WARNING  | monitor:real problem here")
+
+    text = "\n".join(render_failure_report(progress, buffer))
+    assert "real problem" in text
+    assert "noise" not in text
+
+
+def test_report_flags_sites_failing_many_runs_in_a_row():
+    progress, buffer = _run_with_failures(
+        [("https://dead-bride.com", "домен не резолвится", None)]
+    )
+    for shop in progress.shops:
+        if "dead-bride" in shop.url:
+            shop.fails_streak = 5
+    text = "\n".join(render_failure_report(progress, buffer))
+    assert "падает 5 раз подряд" in text
+
+
+def test_publisher_sends_the_report_to_every_admin():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111, 222))
+
+    async def scenario():
+        await pub.start()
+        pub.progress.set_total(2)
+        pub.progress.begin("https://broken.example.com")
+        pub.progress.finish(
+            "https://broken.example.com", "failed", error="403 — блокируют бота"
+        )
+        await pub.tick()
+        await pub.stop()
+
+    asyncio.run(scenario())
+
+    sends = [c for c in bot.calls if c["kind"] == "send"]
+    reports = [
+        c for c in sends if "Ошибки парсинга" in c["text"]
+    ]
+    assert [c["chat_id"] for c in reports] == [111, 222]
+    assert "broken.example.com" in reports[0]["text"]
+
+
+def test_publisher_sends_no_report_when_the_run_was_clean():
+    bot = _FakeBot()
+    pub, _ = _publisher(bot, (111,))
+
+    async def scenario():
+        await pub.start()
+        pub.progress.set_total(1)
+        pub.progress.begin("https://fine.example.com")
+        pub.progress.finish("https://fine.example.com", "ok", new_urls=1)
+        await pub.tick()
+        await pub.stop()
+
+    asyncio.run(scenario())
+
+    sends = [c for c in bot.calls if c["kind"] == "send"]
+    assert not [c for c in sends if "Ошибки парсинга" in c["text"]]

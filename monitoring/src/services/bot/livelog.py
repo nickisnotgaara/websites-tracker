@@ -56,6 +56,21 @@ _MAX_URL_CHARS = 40
 _MAX_LOG_LINE = 300
 _MAX_TAIL_LINES = 600
 
+# Failure report (sent as follow-up messages after the run finishes)
+_REPORT_TARGET = 3900  # per-message budget, under TELEGRAM_TEXT_LIMIT
+_REPORT_MAX_PER_CHUNK = 45  # keeps the list scannable, not just legal
+_REPORT_HEADERS = (
+    "🩺 Парсинг конкурентов",
+    "🔍 Причины ошибок",
+)
+# Mirrors health.DEAD_AFTER_RUNS without importing the storage layer into the
+# bot: this module must stay importable on its own (tests import it directly).
+_STREAK_HIGHLIGHT = 3
+# Levels worth repeating in the report: the INFO spam is what made the old
+# message unreadable (it was 30% of the budget and said nothing).
+_REPORT_LOG_LEVELS = ("WARNING", "ERROR", "CRITICAL")
+_MAX_REPORT_LOG_LINES = 15
+
 _DEFAULT_DENY = (
     "aiogram",
     "aiohttp",
@@ -375,10 +390,28 @@ def _compose(
     if progress.run_error:
         blocks.append(f"❗ {html.escape(progress.run_error)}")
 
+    # Reason summary: N failures become a handful of readable lines instead of
+    # N near-identical ones, and it is the part that answers "why did it fail".
+    summary = _reason_summary(progress)
+    if summary and progress.finished_at is not None:
+        blocks.append("<b>Причины:</b>\n" + "\n".join(summary))
+
     if progress.shops:
         lines = [_shop_line(s) for s in shown]
         if hidden:
-            lines.insert(0, f"… ещё {hidden} магазинов (ошибки — вверху)")
+            # Honest wording: some failures may be below the cut too, and the
+            # report message holds the complete list. Saying "ошибки — вверху"
+            # alone was how failures disappeared without anyone noticing.
+            shown_urls = {s.url for s in shown}
+            hidden_failures = sum(
+                1
+                for s in progress.shops
+                if s.state == "failed" and s.url not in shown_urls
+            )
+            hint = f"… ещё {hidden} магазинов"
+            if hidden_failures:
+                hint += f", из них {hidden_failures} с ошибками"
+            lines.insert(0, hint + " — полный список в отчёте об ошибках")
         blocks.append("<b>Магазины:</b>\n" + "\n".join(lines))
 
     dead = _dead_section(progress)
@@ -436,6 +469,159 @@ def render(
             dropped += 1
             continue
         return text[:max_chars]
+
+
+def _reason_summary(progress: RunProgress, max_domains: int = 4) -> list[str]:
+    """Group failures by reason: '403 — блокируют бота — 50 сайтов'.
+
+    Fifty identical lines carry one bit of information. Grouping is what makes
+    the summary readable *and* what frees the character budget for the full
+    per-site list in the follow-up messages.
+    """
+    groups: dict[str, list[ShopStatus]] = {}
+    for shop in progress.shops:
+        if shop.state != "failed":
+            continue
+        reason = shop.error or shop.fail_code or "ошибка"
+        groups.setdefault(reason, []).append(shop)
+
+    lines = []
+    for reason, shops in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        names = [_short_url(s.url) for s in shops]
+        shown = names[:max_domains]
+        more = len(names) - len(shown)
+        tail = ", ".join(shown) + (f" и ещё {more}" if more > 0 else "")
+        lines.append(f"• <b>{html.escape(reason)}</b> — {len(shops)}: {html.escape(tail)}")
+    return lines
+
+
+def _shop_detail(shop: ShopStatus) -> str:
+    """`domain — reason (duration)` for one failure, no icon noise."""
+    name = html.escape(_short_url(shop.url))
+    reason = html.escape(shop.error or shop.fail_code or "ошибка")
+    parts = [reason]
+    if shop.http_status and str(shop.http_status) not in reason:
+        parts.append(f"HTTP {shop.http_status}")
+    detail = " · ".join(parts)
+    if shop.truncated:
+        detail += " · много URL"
+    if shop.duration >= 1:
+        detail += f" · {_fmt_duration(shop.duration)}"
+    if shop.fails_streak >= _STREAK_HIGHLIGHT:
+        detail += f" · падает {shop.fails_streak} раз подряд"
+    return f"❌ {name} — {detail}"
+
+
+def _grouped_detail(shops: Sequence[ShopStatus], wrap: int = 6) -> list[str]:
+    """Compact per-reason domain lists for the report body.
+
+    Forty-five identical '403' rows cost more characters than the names of the
+    forty-five sites do. Grouping them turns the report from a wall of repeats
+    into something a person can actually scan -- and it is what lets every
+    failed site fit in a single message.
+    """
+    lines: list[str] = []
+    extra_suffixes: dict[str, list[str]] = {}
+    for shop in shops:
+        reason = shop.error or shop.fail_code or "ошибка"
+        note = ""
+        if shop.fails_streak >= _STREAK_HIGHLIGHT:
+            note = f"падает {shop.fails_streak} раз подряд"
+        elif shop.truncated:
+            note = "много URL"
+        elif shop.duration >= 60:
+            note = _fmt_duration(shop.duration)
+        if note:
+            extra_suffixes.setdefault(reason, []).append(
+                f"{_short_url(shop.url)} ({note})"
+            )
+
+    groups: dict[str, list[str]] = {}
+    for shop in shops:
+        reason = shop.error or shop.fail_code or "ошибка"
+        groups.setdefault(reason, []).append(_short_url(shop.url))
+
+    for reason, names in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        rows: list[str] = []
+        for i in range(0, len(names), wrap):
+            rows.append(", ".join(names[i : i + wrap]))
+        body = "\n".join(rows)
+        extra = extra_suffixes.get(reason) or []
+        tail = f"\n  ↳ {', '.join(extra)}" if extra else ""
+        lines.append(f"<b>{html.escape(reason)}</b> ({len(names)}):{tail}\n  {body}")
+
+    return lines
+
+
+def _relevant_log_lines(buffer: LogBuffer, limit: int = _MAX_REPORT_LOG_LINES) -> list[str]:
+    """Only WARNING+ lines: the INFO stream is noise in a failure report."""
+    wanted = tuple(f"| {lvl} " for lvl in _REPORT_LOG_LEVELS)
+    picked = [line for line in buffer.tail(_MAX_TAIL_LINES) if any(w in line for w in wanted)]
+    return [html.escape(line) for line in picked[-limit:]]
+
+
+def render_failure_report(
+    progress: RunProgress,
+    buffer: LogBuffer,
+    *,
+    max_chars: int = _REPORT_TARGET,
+    max_per_chunk: int = _REPORT_MAX_PER_CHUNK,
+) -> list[str]:
+    """Every failed site, split into as many Telegram messages as it takes.
+
+    The single live message cannot hold 55 failures *and* stay useful, so the
+    full list goes out as follow-ups. Returns an empty list when nothing
+    failed, so a clean run sends nothing extra.
+    """
+    failed = [s for s in progress.shops if s.state == "failed"]
+    if not failed:
+        return []
+
+    header = (
+        f"🔍 <b>Ошибки парсинга</b> — {len(failed)} из "
+        f"{progress.total or len(progress.shops)} сайтов"
+    )
+    log_tail = ""
+    log_lines = _relevant_log_lines(buffer)
+    if log_lines:
+        extra = "<b>Логи (ошибки):</b>\n" + "\n".join(log_lines)
+        log_tail = "\n\n" + extra
+
+    # Preferred: grouped by reason. Usually everything fits in one message.
+    grouped = _grouped_detail(failed)
+    if grouped:
+        single = f"{header}\n\n" + "\n\n".join(grouped)
+        # The grouped form is measured, never assumed to fit: 200 failures
+        # overflow it, and Telegram REJECTS an over-limit message outright
+        # (it does not truncate it), so the check is not optional.
+        if len(single + log_tail) <= max_chars:
+            return [single + log_tail]
+
+    # Fallback: one row per site, split across as many messages as needed.
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for shop in failed:
+        line = _shop_detail(shop)
+        if current and (
+            current_len + len(line) + 1 > max_chars - len(header) - 2
+            or len(current) >= max_per_chunk
+        ):
+            chunks.append(current)
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += len(line) + 1
+    if current:
+        chunks.append(current)
+
+    total = len(chunks)
+    out: list[str] = []
+    for i, lines in enumerate(chunks, start=1):
+        title = header + (f"  ({i}/{total})" if total > 1 else "")
+        body = "\n".join([title, ""] + lines)
+        out.append(body + (log_tail if i == total else ""))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -544,6 +730,25 @@ class LiveLogMessage:
     async def publish(self, text: str | None = None) -> None:
         """Push the current state to this chat (used by LiveRunPublisher)."""
         await self._flush(pre_rendered=text)
+
+    async def send_followup(self, text: str) -> None:
+        """Send one extra message to this chat (the failure report).
+
+        Goes through the same throttle and error handling as an edit, so a 429
+        mid-report is honoured instead of flooding the chat.
+        """
+        if not self.is_active:
+            return
+        await self._gate()
+        try:
+            await self.bot.send_message(
+                self.chat_id, text, parse_mode=self._parse_mode
+            )
+            self._last_call = self._clock()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._handle_error(exc, text)
 
     # -- internals --------------------------------------------------------
     async def _flush(self, pre_rendered: str | None = None) -> None:
@@ -770,6 +975,39 @@ class LiveRunPublisher:
                 raise
             except Exception as exc:
                 self._note(f"subscriber {chat_id} final update failed", exc)
+        await self._send_failure_report()
+
+    async def _send_failure_report(self) -> None:
+        """Post every failed site as follow-up messages.
+
+        One message cannot hold 55 failures and stay readable, so the detail
+        that did not fit goes out as separate messages. Rendered once and sent
+        to all admins, mirroring how the live message fans out.
+        """
+        try:
+            chunks = render_failure_report(self.progress, self.buffer)
+        except Exception as exc:
+            self._note("failure report render failed", exc)
+            return
+        if not chunks:
+            return
+        self._note_info(f"failure report: {len(chunks)} message(s)")
+        for chat_id in self._order:
+            sub = self.subscribers[chat_id]
+            if not sub.is_active:
+                continue
+            for chunk in chunks:
+                try:
+                    await sub.send_followup(chunk)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self._note(f"failure report to {chat_id} failed", exc)
+                    break  # one broken chat must not retry the same chunk
+            await self._sleep(self._SUBSCRIBER_GAP)
+
+    def _note_info(self, message: str) -> None:
+        logger.info(message)
 
     def _note(self, context: str, exc: Exception) -> None:
         key = f"{context}:{type(exc).__name__}:{exc}"

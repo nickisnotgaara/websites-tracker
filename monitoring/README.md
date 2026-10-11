@@ -55,10 +55,27 @@ button and the 08:00 MSK cron). One run, one message per chat; the run owns the
 log, admins are subscribers — so a scheduled run is no longer silent.
 
 Each message carries a progress header (`3/9`, elapsed, ✅/❌ counters), the
-trigger that started the run, a `✅ / ❌ / ⏳ / ⏸️` line per competitor with the
+trigger that started the run, a **summary of reasons** grouped by cause
+(`403 — блокируют бота — 45: …`), a `✅ / ❌ / ⏳ / ⏸️` line per competitor with the
 failure reason, a "Падают подряд" section for sites that failed 3+ runs in a row,
 and the tail of the log lines. The message is rewritten with `editMessageText`,
 so no new message is created per update.
+
+### Full failure report
+
+One 4096-char message cannot hold 50+ failures and stay readable, so when the
+run finishes the bot sends **follow-up messages listing every failed site** —
+grouped by reason, every domain named, `⚠️` lines for sites that keep failing.
+A clean run sends nothing extra. A pathological run (200+ failures) falls back
+to one line per site split across as many messages as needed.
+
+The invariant the tests enforce: **no failed site disappears from the output**.
+If the main message had to cut failures, it says so explicitly
+(`… ещё 238 магазинов — полный список в отчёте об ошибках`) instead of the old
+`ошибки — вверху`, which was literally untrue when the cut landed on a failure.
+
+Report messages include only `WARNING`/`ERROR` log lines — the `INFO` stream was
+30% of the old message's budget and said nothing.
 
 Telegram allows ~1 message/second per chat, so edits are throttled and identical
 renders are never sent. Each chat is throttled and error-handled independently:
