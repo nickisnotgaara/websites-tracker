@@ -6,8 +6,9 @@ Sheets.
 
 ## What it does
 
-1. Cron at 08:00 Moscow time (or manual "🚀 Начать парсинг" in Telegram)
-   triggers a check
+1. The schedule (default: 08:00 Moscow time **daily**) — or the manual
+   "🚀 Начать парсинг" button in Telegram — triggers a check. Set `SCHEDULE_DAYS`
+   to pick the weekdays, e.g. `mon,thu` for twice a week.
 2. For each competitor URL in the Google Sheet "Отслеживаемые конкуренты":
    - Sitemap discovery (`/sitemap.xml`, `/robots.txt` → sitemap, link fallback)
    - Diff vs known URLs in `data/tracker.db`
@@ -51,8 +52,8 @@ docker run -d --name competitor-monitor \
 
 During a run the bot mirrors that log into a **self-updating Telegram message**
 sent to **every admin account**, for both triggers (the "🚀 Начать парсинг"
-button and the 08:00 MSK cron). One run, one message per chat; the run owns the
-log, admins are subscribers — so a scheduled run is no longer silent.
+button and the configured schedule). One run, one message per chat; the run
+owns the log, admins are subscribers — so a scheduled run is no longer silent.
 
 Each message carries a progress header (`3/9`, elapsed, ✅/❌ counters), the
 trigger that started the run, a **summary of reasons** grouped by cause
@@ -133,6 +134,37 @@ Tunable via `.env` (all optional):
 | `TELEGRAM_LIVE_LOG_LEVEL` | `INFO` | loguru level mirrored into Telegram |
 | `TELEGRAM_LIVE_LOG_MIN_GAP` | `1.05` | Hard floor between two API calls to the same chat |
 | `TELEGRAM_LIVE_LOG_BUFFER` | `2000` | In-memory log ring buffer size |
+
+### Schedule
+
+The schedule lives in `.env` and needs a bot restart to take effect:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCHEDULE_DAYS` | `*` | `mon,thu` for twice a week, `mon,tue,wed,thu,fri` for weekdays, `*` daily |
+| `SCHEDULE_HOUR` | `8` | Hour in `SCHEDULE_TZ` |
+| `SCHEDULE_MINUTE` | `0` | Minute |
+| `SCHEDULE_TZ` | `Europe/Moscow` | IANA timezone |
+
+The bot logs what it scheduled (`Scheduler started. Next run: пн, чт в
+08:00`). An unknown day name is rejected at startup with a message naming the
+valid values, instead of silently falling back to daily.
+
+### "No new items" is not an error
+
+A site that was checked successfully and simply has nothing new is a different
+outcome from a site that could not be checked, and the report says so
+explicitly:
+
+```
+✅ quiet-shop.com — проверен · новых нет      ← reachable, nothing new
+❌ blocked-shop.com — 403 — блокируют бота    ← could not be checked
+```
+
+A clean run with zero new items states `🆕 нет новых` in the header instead of
+showing a bare count. The failure report header separates the two as well
+(`✅ Проверено успешно: 2 (из них без новинок: 1, с новинками: 1)`), and the
+list below it contains failures only.
 
 ## Data
 

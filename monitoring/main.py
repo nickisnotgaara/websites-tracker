@@ -11,6 +11,49 @@ from src.services.bot.livelog import get_buffer, install_sink
 from src.services.bot.main import dp, bot, run_parsing_job, run_startup_job
 
 
+_DAY_NAMES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DAY_LABELS = {
+    "mon": "пн",
+    "tue": "вт",
+    "wed": "ср",
+    "thu": "чт",
+    "fri": "пт",
+    "sat": "сб",
+    "sun": "вс",
+}
+
+
+def _build_trigger(tz) -> tuple[CronTrigger, str]:
+    """Cron trigger from settings, plus a human-readable description.
+
+    Validating the day names here turns a silent APScheduler error at boot
+    into a message that says which value is wrong.
+    """
+    raw = (settings.SCHEDULE_DAYS or "*").strip().lower()
+    if raw in ("*", "all", "daily", ""):
+        days = "*"
+        day_desc = "ежедневно"
+    else:
+        requested = [d.strip() for d in raw.split(",") if d.strip()]
+        unknown = [d for d in requested if d not in _DAY_NAMES]
+        if unknown:
+            raise ValueError(
+                f"SCHEDULE_DAYS has unknown day(s): {unknown}. "
+                f"Use any of {', '.join(_DAY_NAMES)}, e.g. 'mon,thu'."
+            )
+        days = ",".join(requested)
+        labels = [_DAY_LABELS[d] for d in requested]
+        day_desc = ", ".join(labels)
+
+    trigger = CronTrigger(
+        hour=settings.SCHEDULE_HOUR,
+        minute=settings.SCHEDULE_MINUTE,
+        day_of_week=days,
+        timezone=tz,
+    )
+    return trigger, f"{day_desc} в {settings.SCHEDULE_HOUR:02d}:{settings.SCHEDULE_MINUTE:02d}"
+
+
 async def main():
     logger.info("Starting Competitor Tracker...")
 
@@ -23,18 +66,18 @@ async def main():
 
     # Initialize Scheduler
     scheduler = AsyncIOScheduler()
-    msk_tz = pytz.timezone("Europe/Moscow")
+    msk_tz = pytz.timezone(settings.SCHEDULE_TZ)
 
-    # Schedule job at 8:00 AM MSK daily
+    trigger, schedule_desc = _build_trigger(msk_tz)
     scheduler.add_job(
         run_parsing_job,
-        CronTrigger(hour=8, minute=0, timezone=msk_tz),
-        id="daily_check",
-        name="Daily Competitor Check",
+        trigger,
+        id="scheduled_check",
+        name="Scheduled Competitor Check",
     )
 
     scheduler.start()
-    logger.info("Scheduler started. Job scheduled for 08:00 MSK daily.")
+    logger.info(f"Scheduler started. Next run: {schedule_desc} ({settings.SCHEDULE_TZ}).")
 
     # Start Startup Init (Background)
     # Disabled by user request: Only start on Manual Trigger or Cron

@@ -41,6 +41,18 @@ class Settings(BaseSettings):
     SPREADSHEET_ID: str
 
     # Scheduling
+    # The schedule used to be hardcoded to 08:00 every day in main.py, which is
+    # why changing anything had no effect. These settings are the real control.
+    # SCHEDULE_DAYS accepts APScheduler day names: "mon", "mon,thu", or "*"
+    # for every day.
+    SCHEDULE_DAYS: str = "*"
+    SCHEDULE_HOUR: int = 8
+    SCHEDULE_MINUTE: int = 0
+    SCHEDULE_TZ: str = "Europe/Moscow"
+
+    # Legacy: stored in app_config by Storage.get_cron_interval(), but the
+    # scheduler never read it -- setting it changed nothing. Kept only so old
+    # databases still open.
     DEFAULT_CRON_INTERVAL_MINUTES: int = 60
 
     model_config = SettingsConfigDict(

@@ -308,6 +308,10 @@ def _header(progress: RunProgress) -> str:
         counters += f" · ⏭️ {progress.skipped_count}"
     if progress.total_new:
         counters += f" · 🆕 {progress.total_new}"
+    elif progress.ok_count:
+        # No new items at all is a *successful* result and must not look like
+        # an error run: say it outright instead of showing a bare ✅ count.
+        counters += " · 🆕 нет новых"
     tail = "   " + progress.trigger if progress.trigger else ""
     return f"{title}\n⏱ {_fmt_duration(progress.elapsed)}   {counters}{tail}"
 
@@ -316,7 +320,9 @@ def _shop_line(shop: ShopStatus) -> str:
     icon = _ICONS.get(shop.state, "⏸️")
     name = html.escape(_short_url(shop.url))
     if shop.state == "ok":
-        detail = f"{shop.new_urls} новых" if shop.new_urls else "без новых"
+        # "проверен, новых нет" vs "5 новых": the site was reachable in both
+        # cases, so the wording must not read like a failure.
+        detail = f"{shop.new_urls} новых" if shop.new_urls else "проверен · новых нет"
     elif shop.state == "failed":
         detail = html.escape(shop.error or "ошибка")
         if shop.http_status and f"{shop.http_status}" not in detail:
@@ -581,6 +587,17 @@ def render_failure_report(
         f"🔍 <b>Ошибки парсинга</b> — {len(failed)} из "
         f"{progress.total or len(progress.shops)} сайтов"
     )
+    # Make the distinction explicit: reachable-with-no-news is NOT a failure,
+    # and the operator asked for these two to stop reading the same.
+    checked_ok = progress.ok_count
+    quiet = sum(
+        1 for s in progress.shops if s.state == "ok" and not s.new_urls
+    )
+    if checked_ok:
+        header += (
+            f"\n✅ Проверено успешно: {checked_ok}"
+            f" (из них без новинок: {quiet}, с новинками: {checked_ok - quiet})"
+        )
     log_tail = ""
     log_lines = _relevant_log_lines(buffer)
     if log_lines:
